@@ -87,7 +87,7 @@ require Exporter;
 use strict;
 use warnings;
 
-use version; our $VERSION = qv('1.0.0');
+use version; our $VERSION = qv('1.0.1');
 
 use Stat::lsMode;
 use Fcntl qw( O_RDWR O_CREAT O_TRUNC O_EXCL O_RDONLY O_WRONLY SEEK_SET );
@@ -1601,7 +1601,7 @@ __END__
 #-------------------------------------------------------------------------------
 =head1 NAME
 
-Net::SFTP::SftpServer - A Perl implementation of the SFTP subsystem with use access controls
+Net::SFTP::SftpServer - A Perl implementation of the SFTP subsystem with user access controls
 
 =head1 SYNOPSIS
 
@@ -1729,13 +1729,15 @@ Array of valid characters for filenames
 
 allow, deny
 
-Actions allowed or denied - see L<PERMISSIONS> for details, Default is to allow ALL.
+Actions allowed or denied - see L</PERMISSIONS> for details, Default is to allow ALL.
 
 =item
 
 fake_ok
 
-Array of actions (see action contants in L<PERMISSIONS>) which will be given response SSH2_FX_OK instead of SSH2_FX_PERMISSION_DENIED when denied by above deny options. Default=[]
+Array of actions (see action contants in L</PERMISSIONS>) which will be given response SSH2_FX_OK instead of SSH2_FX_PERMISSION_DENIED when denied by above deny options. Default=[]
+
+=back
 
 =head1 PERMISSIONS
 

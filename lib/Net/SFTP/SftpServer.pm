@@ -87,7 +87,7 @@ require Exporter;
 use strict;
 use warnings;
 
-use version; our $VERSION = qv('1.0.3');
+use version; our $VERSION = qv('1.0.4');
 
 use Stat::lsMode;
 use Fcntl qw( O_RDWR O_CREAT O_TRUNC O_EXCL O_RDONLY O_WRONLY SEEK_SET );
@@ -1885,6 +1885,7 @@ This configuration:
   Fcntl
   POSIX
   Sys::Syslog
+  Errno
 
 =head1 SEE ALSO
 

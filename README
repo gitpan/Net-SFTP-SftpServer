@@ -258,6 +258,7 @@ DEPENDENCIES
       Fcntl
       POSIX
       Sys::Syslog
+      Errno
 
 SEE ALSO
     Sftp protocol

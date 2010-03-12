@@ -61,12 +61,12 @@ my $sftp = Net::SFTP::SftpServer->new(
 $sftp->run();
 
 sub ActionOnSent {
-  my $filename = shift;
+  my $fileObject = shift;
    ## Do Stuff
 }
 
 sub ActionOnReceived {
-  my $filename = shift;
+  my $fileObject = shift;
    ## Do Stuff
 }
 

@@ -18,7 +18,6 @@
 # * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 # */
 #
-
 package Net::SFTP::SftpServer;
 require Exporter;
 @ISA = qw(Exporter);
@@ -87,7 +86,7 @@ require Exporter;
 use strict;
 use warnings;
 
-use version; our $VERSION = qv('1.0.6');
+use version; our $VERSION = qv('1.1.0');
 
 use Stat::lsMode;
 use Fcntl qw( O_RDWR O_CREAT O_TRUNC O_EXCL O_RDONLY O_WRONLY SEEK_SET );
@@ -246,6 +245,19 @@ use constant ACTIONS => [
                               SSH2_FXP_SYMLINK,
                             ];
 
+use constant STATUS_MESSAGE => [
+  "Success",                #/* SSH2_FX_OK */
+  "End of file",            #/* SSH2_FX_EOF */
+  "No such file",           #/* SSH2_FX_NO_SUCH_FILE */
+  "Permission denied",      #/* SSH2_FX_PERMISSION_DENIED */
+  "Failure",                #/* SSH2_FX_FAILURE */
+  "Bad message",            #/* SSH2_FX_BAD_MESSAGE */
+  "No connection",          #/* SSH2_FX_NO_CONNECTION */
+  "Connection lost",        #/* SSH2_FX_CONNECTION_LOST */
+  "Operation unsupported",  #/* SSH2_FX_OP_UNSUPPORTED */
+  "Unknown error"            #/* Others */
+];
+
 my $USER = getpwuid($>);
 my $ESCALATE_DEBUG = 0;
 # --------------------------------------------------------------------
@@ -291,11 +303,89 @@ sub initLog {
   logDetail "Client connected to   $local_ip:$local_port";
 }
 #-------------------------------------------------------------------------------
+sub getLogMsg {
+  my $self = shift;
+  my %arg = @_;
+
+  my $req = $self->{_payload}->getPayloadContent();
+
+  my $process = MESSAGE_TYPES->{$req->{message_type}};
+
+  if ($req->{handle}){
+    $req->{name} =  $self->{_payload}->getFilename() ;
+  }
+
+  my $msg = '';
+  if (defined $arg{response} and $arg{response}->getType() == SSH2_FXP_STATUS ){
+    $msg = 'response: ' . STATUS_MESSAGE->[$arg{response}->getStatus()] . ' ';
+  }
+
+  $msg .= "process: $process";
+
+  if ($req->{id}){
+    $msg .= " id: $req->{id}";
+  }
+
+  if ($req->{name}){
+    $msg .= " filename: $req->{name}";
+  }
+
+  for my $field( qw( source_name target_name off len pflags ) ){
+    if (defined $req->{$field}){
+      $msg .= " $field: $req->{$field}";
+    }
+  }
+
+  if ($req->{attr}){
+    for my $key (keys %{$req->{attr}}){
+      $msg .= " attr-$key: $req->{attr}{$key}";
+    }
+  }
+
+  return $msg;
+}
+#-------------------------------------------------------------------------------
+sub logAction {
+  my $self = shift;
+
+  my $req = $self->{_payload}->getPayloadContent();
+
+  my $msg = $self->getLogMsg();
+
+  if ( $self->{log_action_supress}{ $req->{message_type} } ){
+    logDetail $msg;
+  }
+  else {
+    logGeneral $msg;
+  }
+}
+#-------------------------------------------------------------------------------
+sub logStatus {
+  my $self = shift;
+  my $response = shift;
+  my $msg = $self->getLogMsg(response => $response);
+  my $req = $self->{_payload}->getPayloadContent();
+
+  if ( $response->getType() == SSH2_FXP_STATUS
+      and ( $self->{log_all_status} or ( $response->getStatus() != SSH2_FX_OK and $response->getStatus() != SSH2_FX_EOF ) )){
+    logGeneral $msg;
+  }
+  elsif ( $response->getType() == SSH2_FXP_DATA or $req->{message_type} == SSH2_FXP_WRITE ){
+    # Do nothing - otherwise we spam the syslog with every read/write packet
+  }
+  else {
+    logDetail $msg;
+  }
+
+}
+#-------------------------------------------------------------------------------
 sub new {
   my $class = shift;
   my $self  = {};
   bless $self, $class;
   Stat::lsMode->novice(0); #disable warnings from this module
+
+  $self->{client_version} = 3; # Just in case we have a bad client that doesn't init the connection properly, treat it as latest version
 
   my %arg = @_;
   if (defined $arg{debug}     ){ $ESCALATE_DEBUG     = $arg{debug}  };
@@ -306,6 +396,8 @@ sub new {
   if (defined $arg{dir_perms} ){ $self->{dir_perms}  = $arg{dir_perms}  };
 
   $self->{home_dir} = "$self->{home}/$USER";
+  $self->{FS} = Net::SFTP::SftpServer::FS->new();
+  $self->{FS}->setChrootDir( $self->{home_dir} );
   unless ( -d $self->{home_dir} ){
     logWarning "No sftp folder $self->{home_dir} found for $USER";
     exit 1;
@@ -320,6 +412,12 @@ sub new {
   }
   if (defined $arg{on_file_received}){
     $self->{on_file_received} = $arg{on_file_received};
+  }
+  if (defined $arg{move_on_sent}){
+    $self->{move_on_sent} = $arg{move_on_sent};
+  }
+  if (defined $arg{move_on_received}){
+    $self->{move_on_received} = $arg{move_on_received};
   }
 
   $self->{use_tmp_upload} = (defined $arg{use_tmp_upload} and $arg{use_tmp_upload}) ? 1 : 0;
@@ -368,6 +466,25 @@ sub new {
   $self->{handle_count} = 0;
   $self->{open_handle_count} = 0;
 
+  # Logging levels
+
+  $self->{log_action}  = { map { $_ => 1 } @{ $arg{log_action}  } };
+  $self->{log_action_supress} = { map { $_ => 1 }
+                          grep { not defined $self->{log_action}{$_} }
+                          @{ $arg{log_action_supress} },
+                            ( SSH2_FXP_READ,
+                              SSH2_FXP_READDIR,
+                              SSH2_FXP_WRITE,
+                              SSH2_FXP_CLOSE,
+                              SSH2_FXP_OPENDIR,
+                              SSH2_FXP_STAT,
+                              SSH2_FXP_FSTAT,
+                              SSH2_FXP_LSTAT,
+                              SSH2_FXP_REALPATH,
+                               ) };
+
+  $self->{log_all_status} = defined $arg{log_all_status} ? $arg{log_all_status} : 0;
+
   return $self;
 }
 #-------------------------------------------------------------------------------
@@ -383,11 +500,11 @@ sub run {
       exit 1;
     }
 
-    my $data;
+    my $req;
     eval {
       local $SIG{ALRM} = sub { die "alarm\n" }; # NB: \n required
       alarm TIMEOUT;
-      $data = $self->readData( $packet_length );
+      $req = $self->readData( $packet_length );
       alarm 0;
     };
     if ($@) {
@@ -395,7 +512,8 @@ sub run {
       exit 1;
     }
 
-    my $payload       = Net::SFTP::SftpServer::Buffer->new( data => $data );
+    my $payload       = Net::SFTP::SftpServer::Buffer->new( data => $req );
+    $self->{_payload} = $payload; # Keep a copy on self for debug output
     #/* process requests from client */
     # note - all send data will be called from the handler for this message type
     $self->process($payload);
@@ -405,11 +523,11 @@ sub run {
 sub readData {
   my $self = shift;
   my $len = shift;
-  my $data = '';
+  my $req = '';
   #logDetail "Going to read $len bytes";
-  while (length $data < $len){
+  while (length $req < $len){
     my $buf;
-    my $read_len = sysread( STDIN, $buf, $len - length $data );
+    my $read_len = sysread( STDIN, $buf, $len - length $req );
     if ($read_len == 0) {
       logGeneral("Client disconnected");
       $self->closeHandlesOnExit();
@@ -421,10 +539,10 @@ sub readData {
       exit 1;
     }
     else {
-      $data .= $buf;
+      $req .= $buf;
     }
   }
-  return $data;
+  return $req;
 }
 #-------------------------------------------------------------------------------
 sub closeHandlesOnExit {
@@ -455,11 +573,15 @@ sub sendMessage {
 #-------------------------------------------------------------------------------
 sub getHandle {
   my $self = shift;
-  my $handle_no = shift;
+  my $payload = shift;
   my $type = shift || '';
-
+  my $req = $payload->getPayloadContent();
+  my $handle_no = $req->{handle};
   if (defined $self->{handles}{$handle_no} and ($type eq '' or $type eq $self->{handles}{$handle_no}->getType())){
-    return $self->{handles}{$handle_no};
+    my $handle = $self->{handles}{$handle_no};
+    $payload->setFilename( $handle->getFilename() );
+    $payload->setFileType( $handle->getType()     );
+    return $handle;
   }
   return;
 }
@@ -468,8 +590,10 @@ sub deleteHandle {
   my $self = shift;
   my $handle_no = shift;
 
-  $self->{open_handle_count}--;
-  delete $self->{handles}{$handle_no};
+  if (defined $self->{handles}{$handle_no}){
+    $self->{open_handle_count}--;
+    delete $self->{handles}{$handle_no};
+  }
 }
 #-------------------------------------------------------------------------------
 sub addHandle {
@@ -488,57 +612,122 @@ sub addHandle {
 sub process {
   my $self = shift;
   my $payload = shift;
-  my $message_type = $payload->getChar();
 
-  logDetail "Got message_type " . MESSAGE_TYPES->{$message_type};
+  my $req = $payload->getPayloadContent(
+    message_type  => 'char',
+  );
 
-  if (defined MESSAGE_HANDLER->{$message_type}){
-    my $method = MESSAGE_HANDLER->{$message_type};
-    $self->$method($payload);
+  my $response = Net::SFTP::SftpServer::Response->new();
+
+  if ($req->{message_type} != SSH2_FXP_INIT){
+    # Init does not have an id - it has a client version - handled in processInit
+    $req = $payload->getPayloadContent(
+      id            => 'int',
+    );
+    $response->setId( $req->{id} )
+  }
+
+  logDetail "Got message_type " . MESSAGE_TYPES->{$req->{message_type}};
+
+  if (defined MESSAGE_HANDLER->{$req->{message_type}}){
+    my $method = MESSAGE_HANDLER->{$req->{message_type}};
+    $self->$method($payload, $response);
   }
   else {
-    logWarning("Unknown message $message_type");
+    logWarning("Unknown message $req->{message_type}");
+    $response->setStatus( SSH2_FX_BAD_MESSAGE );
   }
   logWarning "Data left in buffer" unless $payload->done(); # check buffer is empty or warn
+
+  $self->sendResponse( $response );
+}
+#-------------------------------------------------------------------------------
+sub sendResponse {
+  my $self = shift;
+  my $response = shift;
+
+  $self->logStatus( $response );
+
+  my $msg;
+  my $type = $response->getType();
+
+  if ($type == SSH2_FXP_STATUS){
+    my $status = $response->getStatus();
+    $msg = pack('CNN', SSH2_FXP_STATUS, $response->getId() || 0, $status);
+    if ($self->{client_version} >= 3){
+      $msg .= pack('N', length STATUS_MESSAGE->[$status]) . STATUS_MESSAGE->[$status] . pack('N', 0);
+    }
+  }
+  elsif ($type == SSH2_FXP_HANDLE){
+    my $handle = $response->getHandle();
+    $msg = pack('CNN', SSH2_FXP_HANDLE, $response->getId(), length $handle) . $handle;
+  }
+  elsif ($type == SSH2_FXP_DATA){
+    $msg = pack('CNN', SSH2_FXP_DATA, $response->getId(), $response->getDataLength() )  . $response->getData();
+  }
+  elsif ($type == SSH2_FXP_VERSION){
+    $msg = pack('CN', SSH2_FXP_VERSION, $response->getVersion());
+  }
+  elsif ($type == SSH2_FXP_ATTRS){
+    $msg = pack('CN', SSH2_FXP_ATTRS, $response->getId() ) . $self->encodeAttrib( $response->getAttrs() );
+  }
+  elsif ($type == SSH2_FXP_NAME){
+    my $files = $response->getNames();
+    $msg = pack('CNN', SSH2_FXP_NAME, $response->getId(), scalar @$files );
+    for my $file (@$files) {
+      $msg .= pack('N', length $file->{name})      . $file->{name};
+      $msg .= pack('N', length $file->{long_name}) . $file->{long_name};
+      $msg .= $self->encodeAttrib($file->{attrib});
+    }
+  }
+  else {
+    logError "Unhandled response type: $type";
+    # Make sure we send something back
+    $msg = pack('CNN', SSH2_FXP_STATUS, $response->getId() || 0, SSH2_FX_BAD_MESSAGE );
+    if ($self->{client_version} >= 3){
+      $msg .= pack('N', length STATUS_MESSAGE->[SSH2_FX_BAD_MESSAGE]) . STATUS_MESSAGE->[SSH2_FX_BAD_MESSAGE] . pack('N', 0);
+    }
+  }
+  $self->sendMessage( $msg );
 }
 #-------------------------------------------------------------------------------
 sub processInit {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  $self->{client_version} = $payload->getInt();
-  logGeneral sprintf("processInit: client version %d", $self->{client_version});
+  my $req = $payload->getPayloadContent( client_version => 'int' );
+  $self->{client_version} = $req->{client_version};
+  logGeneral sprintf("Connection accepted, client version: %d", $self->{client_version});
 
-  my $msg = pack('CN', SSH2_FXP_VERSION, SSH2_FILEXFER_VERSION);
-  $self->sendMessage( $msg );
+  $response->setInitVersion( SSH2_FILEXFER_VERSION );
 }
 #-------------------------------------------------------------------------------
 sub processOpen {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $status = SSH2_FX_FAILURE;
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+    pflags  => 'int',         #/* portable flags */
+    attr    => 'attrib',
+  );
 
-  my $id     = $payload->getInt();
-  my $name   = $payload->getString();
-  my $pflags = $payload->getInt();    #/* portable flags */
-  my $attr   = $payload->getAttrib();
+  my $flags  = $self->flagsFromPortable($req->{pflags});
+  my $perm = defined $self->{file_perms}                              ? $self->{file_perms}  :
+             ($req->{attr}{flags} & SSH2_FILEXFER_ATTR_PERMISSIONS)  ? $req->{attr}{perm}        : 0666;
 
-  my $flags  = $self->flagsFromPortable($pflags);
-  my $perm = defined $self->{file_perms}                        ? $self->{file_perms}  :
-             ($attr->{flags} & SSH2_FILEXFER_ATTR_PERMISSIONS)  ? $attr->{perm}        : 0666;
+  $self->logAction();
 
-  logGeneral sprintf("processOpen: open id %u name %s flags %d mode 0%o", $id, $name, $pflags, $perm);
+  return if $self->denyOperation(SSH2_FXP_OPEN, $response);
 
-  return if $self->denyOperation(SSH2_FXP_OPEN, $id);
+  my $filename = $self->makeSafeFileName($req->{name});
 
-  my $filename = $self->makeSafeFileName($name);
-
-  if ((not defined $filename) or ($self->{no_symlinks} and -l $self->{home_dir} . $filename)){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+  if ((not defined $filename) or ($self->{no_symlinks} and $self->{FS}->IsSymlink( $filename ))){
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
-
   # is this an upload
   # We use a tmp file if:
   # We have specified use tmp upload
@@ -546,245 +735,255 @@ sub processOpen {
   # And we are opening for writing
   # And we have either said to truncate the file on opening, or the file does not exist or is empty
   my $use_temp = ($self->{use_tmp_upload}  and
-                  $pflags & SSH2_FXF_CREAT and
-                  $pflags & SSH2_FXF_WRITE and
-                  ( $pflags & SSH2_FXF_TRUNC or -z $self->{home_dir} . $filename ) )    ? 1 : 0;
+                  $req->{pflags} & SSH2_FXF_CREAT and
+                  $req->{pflags} & SSH2_FXF_WRITE and
+                  ( $req->{pflags} & SSH2_FXF_TRUNC or $self->{FS}->ZeroSize( $filename ) ) )    ? 1 : 0;
 
-  my $fd = Net::SFTP::SftpServer::File->new($self->{home_dir} . $filename, $flags, $perm, $use_temp);
+  my $fd = Net::SFTP::SftpServer::File->new( $filename, $flags, $req->{perm}, $use_temp);
   if (not defined $fd) {
-    $status = $self->errnoToPortable($! + 0);
+    $response->setStatus( $self->errnoToPortable($! + 0) );
   } else {
     my $handle = $self->addHandle($fd);
     if (defined $handle){
+      $response->setHandle( $handle );
       logDetail "Opened handle $handle for file $filename";
-      my $msg = pack('CNN', SSH2_FXP_HANDLE, $id, length $handle) . $handle;
-      $self->sendMessage( $msg );
-      return;
+    }
+    else {
+      $response->setStatus( SSH2_FX_FAILURE );
     }
   }
-
-  $self->sendStatus( $id, $status );
 }
 #-------------------------------------------------------------------------------
 sub processClose {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id     = $payload->getInt();
-  my $handle = $payload->getString();
-  logGeneral sprintf("processClose: close id %u handle %d", $id, $handle);
+  my $req = $payload->getPayloadContent(
+    handle  => 'string',
+  );
+
+  $self->logAction();
 
   my $ret = -1;
   my $status;
-  my $fd = $self->getHandle($handle);
+  my $fd = $self->getHandle($payload);
   if (defined $fd){
     $ret = $fd->close();
-    $status = $ret ? SSH2_FX_OK : $self->errnoToPortable($fd->err()) ;
+    $response->setStatus( $ret ? SSH2_FX_OK : $self->errnoToPortable($fd->err()) );
     if( $fd->getType() eq 'file'){
       #log file transmission stats
       logGeneral $fd->getStats();
+      if (defined $self->{move_on_sent} and $fd->wasSent()){
+        $fd->moveToProcessed( %{$self->{move_on_sent}} );
+      }
+      elsif (defined $self->{move_on_received} and $fd->wasReceived()){
+        $fd->moveToProcessed( %{$self->{move_on_received}} );
+      }
       if (defined $self->{on_file_sent} and $fd->wasSent()){
-        $self->{on_file_sent}($fd->getFilename);
+        $fd->setCallback();
+        eval { $self->{on_file_sent}($fd) };
+        if ($@){
+          logError "on_file_sent Handler died with $@";
+        }
       }
       elsif (defined $self->{on_file_received} and $fd->wasReceived()){
-        $self->{on_file_received}($fd->getFilename);
+        $fd->setCallback();
+        eval { $self->{on_file_received}($fd) };
+        if ($@){
+          logError "on_file_received Handler died with $@";
+        }
       }
     }
-    $self->deleteHandle($handle);
   }
   else {
-    $status = SSH2_FX_NO_SUCH_FILE;
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
   }
 
-  $self->sendStatus( $id, $status );
+  $self->deleteHandle($req->{handle});
 }
 #-------------------------------------------------------------------------------
 sub processRead {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $status = SSH2_FX_FAILURE;
+  my $req = $payload->getPayloadContent(
+    handle  => 'string',
+    off     => 'int64',
+    len     => 'int',
+  );
 
-  my $id      = $payload->getInt();
-  my $handle  = $payload->getString();
-  my $off     = $payload->getInt64();
-  my $len     = $payload->getInt();
+  $self->logAction();
 
-  logDetail sprintf("processRead: read id %u handle %d off %llu len %d", $id, $handle,$off, $len);
+  return if $self->denyOperation(SSH2_FXP_READ, $response);
 
-  return if $self->denyOperation(SSH2_FXP_READ, $id);
-
-  my $fd = $self->getHandle($handle, 'file');
+  my $fd = $self->getHandle($payload, 'file');
   if (defined $fd) {
-    if (sysseek($fd, $off, SEEK_SET) < 0) {
+    if ($fd->sysseek($req->{off}, SEEK_SET) < 0) {
       my $errno = $!+0;
       logWarning "processRead: seek failed $!";
-      $status = $self->errnoToPortable($errno);
+      $response->setStatus( $self->errnoToPortable($errno) );
     } else {
       my $buf;
-      my $ret = sysread($fd, $buf, $len);
+      my $ret = $fd->sysread( $buf, $req->{len} );
       if ($ret < 0) {
-        $status = $self->errnoToPortable($!+0);
+        $response->setStatus( $self->errnoToPortable($!+0) );
       }
       elsif ($ret == 0) {
-        $status = SSH2_FX_EOF;
+        $response->setStatus( SSH2_FX_EOF );
       } else {
-        my $msg = pack('CNN', SSH2_FXP_DATA, $id, $ret)  . $buf;
-        $self->sendMessage( $msg );
-        $status = SSH2_FX_OK;
-        $fd->readBytes( $ret ) if $fd->getReadBytes() eq $off; #Only log sequential reads
+        $response->setData( $ret, $buf );
+        $fd->readBytes( $ret ) if $fd->getReadBytes() eq $req->{off}; #Only log sequential reads
       }
     }
   }
-  if ($status != SSH2_FX_OK){
-    $self->sendStatus( $id, $status );
+  else {
+    $response->setStatus( SSH2_FX_FAILURE );
   }
 }
 #-------------------------------------------------------------------------------
 sub processWrite {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $status = SSH2_FX_FAILURE;
+  my $req = $payload->getPayloadContent(
+    handle  => 'string',
+    off     => 'int64',
+    data    => 'string',
+  );
 
-  my $id      = $payload->getInt();
-  my $handle  = $payload->getString();
-  my $off     = $payload->getInt64();
-  my $data    = $payload->getString();
+  $self->logAction();
 
-  logDetail sprintf("processWrite: write id %u handle %d off %llu len %d", $id, $handle, $off, length $data);
-
-  return if $self->denyOperation(SSH2_FXP_WRITE, $id);
+  return if $self->denyOperation(SSH2_FXP_WRITE, $response);
 
 
-  my $fd = $self->getHandle($handle, 'file');
+  my $fd = $self->getHandle($payload, 'file');
   if (defined $fd) {
-    if ($self->{max_file_size} and $off + length $data > $self->{max_file_size}){
-      logError "Attempt to write greater than Max file size, offset: $off, data length:" .  length $data . " on file ". $fd->getFilename();
-      $self->sendStatus( $id, SSH2_FX_PERMISSION_DENIED );
+    if ($self->{max_file_size} and $req->{off} + length $req->{data} > $self->{max_file_size}){
+      logError "Attempt to write greater than Max file size, offset: $req->{off}, data length:" .  length $req->{data} . " on file ". $fd->getFilename();
+      $response->setStatus( SSH2_FX_PERMISSION_DENIED );
       return;
     }
-    elsif ($self->{max_file_size} and $off + length $data > 0.75 * $self->{max_file_size}){
-      logWarning "Attempt to write greater than 75% of Max file size, offset: $off, data length:" .  length $data . " on file ". $fd->getFilename();
+    elsif ($self->{max_file_size} and $req->{off} + length $req->{data} > 0.75 * $self->{max_file_size}){
+      logWarning "Writing greater than 75% of Max file size, offset: $req->{off}, data length:" .  length $req->{data} . " on file ". $fd->getFilename();
     }
-    if (sysseek($fd, $off, SEEK_SET) < 0) {
+    if ($fd->sysseek($req->{off}, SEEK_SET) < 0) {
       my $errno = $!+0;
       logWarning "processRead: seek failed $!";
-      $status = $self->errnoToPortable($errno);
+      $response->setStatus( $self->errnoToPortable($errno) );
     } else {
-      #/* XXX ATOMICIO ? */
-      my $len = length $data;
-      my $ret = syswrite($fd, $data, $len);
+      my $len = length $req->{data};
+      my $ret = $fd->syswrite($req->{data}, $len);
       if ($ret < 0) {
         logWarning "process_write: write failed";
-        $status = $self->errnoToPrtable($!+0);
+        $response->setStatus( $self->errnoToPrtable($!+0) );
       }
       elsif ($ret == $len) {
-        $fd->wroteBytes( $ret ) if $fd->getWrittenBytes() eq $off; #Only log sequential writes;
-        $status = SSH2_FX_OK;
+        $fd->wroteBytes( $ret ) if $fd->getWrittenBytes() eq $req->{off}; #Only log sequential writes;
+        $response->setStatus( SSH2_FX_OK );
       } else {
         logGeneral("nothing at all written");
       }
     }
   }
-  $self->sendStatus( $id, $status );
 }
 #-------------------------------------------------------------------------------
 sub processDoStat{
   my $self = shift;
   my $mode    = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $status = SSH2_FX_FAILURE;
 
-  my $id   = $payload->getInt();
-  my $name = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+  );
 
-  my $filename = $self->makeSafeFileName($name);
-  logDetail sprintf("processStat: %sstat id %u name %s", $mode ? "l" : "", $id, $name);
+  my $filename = $self->makeSafeFileName($req->{name});
 
-  return if $self->denyOperation(($mode ? SSH2_FXP_LSTAT : SSH2_FXP_STAT), $id);
+  $self->logAction();
+  return if $self->denyOperation(($mode ? SSH2_FXP_LSTAT : SSH2_FXP_STAT), $response);
 
-  if ((not defined $filename) or ($self->{no_symlinks} and -l $self->{home_dir} . $filename)){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+  if ((not defined $filename) or ($self->{no_symlinks} and $self->{FS}->IsSymlink( $filename ))){
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
-
-  my @st = $mode ? lstat($self->{home_dir} . $filename) : stat($self->{home_dir} . $filename);
+  my @st = $mode ? $self->{FS}->LStat($filename) : $self->{FS}->Stat($filename);
   if (scalar @st == 0) {
-    $status = $self->errnoToPortable($!+0);
+    $response->setStatus( $self->errnoToPortable($!+0) );
   }
   else {
-    my $attr = $self->statToAttrib(@st);
-    my $msg = pack('CN', SSH2_FXP_ATTRS, $id) . $self->encodeAttrib( $attr );
-    $self->sendMessage( $msg );
-    $status = SSH2_FX_OK;
-  }
-  if ($status != SSH2_FX_OK){
-    $self->sendStatus( $id, $status );
+    $response->setAttrs( $self->statToAttrib(@st) );
   }
 }
 #-------------------------------------------------------------------------------
 sub processStat {
   my $self = shift;
   my $payload = shift;
-  $self->processDoStat(0, $payload);
+  my $response = shift;
+  $self->processDoStat(0, $payload, $response);
 }
 #-------------------------------------------------------------------------------
 sub processLstat {
   my $self = shift;
   my $payload = shift;
-  $self->processDoStat(1, $payload);
+  my $response = shift;
+  $self->processDoStat(1, $payload, $response);
 }
 #-------------------------------------------------------------------------------
 sub processFstat {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
   my $status = SSH2_FX_FAILURE;
 
-  my $id      = $payload->getInt();
-  my $handle  = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    handle  => 'string',
+  );
 
-  logDetail sprintf("fstat id %u handle %d", $id, $handle);
+  $self->logAction();
 
-  return if $self->denyOperation(SSH2_FXP_FSTAT, $id);
+  return if $self->denyOperation(SSH2_FXP_FSTAT, $response);
 
-  my $fd = $self->getHandle($handle);
+  my $fd = $self->getHandle($payload);
   if (defined $fd) {
     my @st = stat($fd);
     if (scalar @st == 0) {
-      $status = $self->errnoToPortable($!+0);
+      $response->setStatus( $self->errnoToPortable($!+0) );
     } else {
-      my $attr = $self->statToAttrib(@st);
-      my $msg = pack('CN', SSH2_FXP_ATTRS, $id) . $self->encodeAttrib( $attr );
-      $status = SSH2_FX_OK;
+      $response->setAttrs(  $self->statToAttrib(@st) );
     }
   }
-  if ($status != SSH2_FX_OK){
-    $self->sendStatus( $id, $status );
+  else {
+    $response->setStatus( SSH2_FX_FAILURE );
   }
 }
 #-------------------------------------------------------------------------------
 sub processSetstat {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
   #We choose not to allow any setting of stats
 
-  my $id   = $payload->getInt();
-  my $name = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+    attr    => 'attrib',
+  );
 
-  my $filename = $self->makeSafeFileName($name);
-  my $attr = $payload->getAttrib();
-  logDetail sprintf("processSetstat: setstat id %u name %s", $id, $name);
+  $self->logAction();
 
-  if ((not defined $filename) or ($self->{no_symlinks} and -l $self->{home_dir} . $filename)){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+  my $filename = $self->makeSafeFileName($req->{name});
+
+  if ((not defined $filename) or ($self->{no_symlinks} and $self->{FS}->IsSymlink( $filename ))){
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
 
-  return if $self->denyOperation(SSH2_FXP_SETSTAT, $id);
+  return if $self->denyOperation(SSH2_FXP_SETSTAT, $response);
 
   logError "processSetstat not implemented";
 }
@@ -792,16 +991,18 @@ sub processSetstat {
 sub processFsetstat {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
   #We choose not to allow any setting of stats
 
-  my $id   = $payload->getInt();
-  my $handle = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    handle  => 'string',
+    attr    => 'attrib',
+  );
 
-  my $attr = $payload->getAttrib();
-  logDetail sprintf("setstat id %u name %s", $id, $handle);
+  $self->logAction();
 
-  return if $self->denyOperation(SSH2_FXP_FSETSTAT, $id);
+  return if $self->denyOperation(SSH2_FXP_FSETSTAT, $response);
 
   logError "processFsetstat not implemented";
 }
@@ -809,60 +1010,62 @@ sub processFsetstat {
 sub processOpendir {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $status = SSH2_FX_FAILURE;
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+  );
 
-  my $id   = $payload->getInt();
-  my $name = $payload->getString();
+  $self->logAction();
 
-  my $pathname = $self->makeSafeFileName($name);
+  my $pathname = $self->makeSafeFileName($req->{name});
 
-  logGeneral sprintf("processOpendir: opendir id %u path %s", $id, $name);
+  return if $self->denyOperation(SSH2_FXP_OPENDIR, $response);
 
-  return if $self->denyOperation(SSH2_FXP_OPENDIR, $id);
-
-  if ((not defined $pathname) or ($self->{no_symlinks} and -l $self->{home_dir} . $pathname)){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+  if ((not defined $pathname) or ($self->{no_symlinks} and $self->{FS}->IsSymlink( $pathname ))){
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
 
-  my $dirp = Net::SFTP::SftpServer::Dir->new($self->{home_dir} . $pathname);
+  my $dirp = Net::SFTP::SftpServer::Dir->new($pathname);
   if (!defined $dirp) {
-    $status = $self->errnoToPortable($!+0);
+    $response->setStatus( $self->errnoToPortable($!+0) );
   } else {
     my $handle = $self->addHandle($dirp);
     if (defined $handle){
-      my $msg = pack('CNN', SSH2_FXP_HANDLE, $id, length $handle) . $handle;
-      $self->sendMessage( $msg );
-      return;
+      $response->setHandle( $handle );
+    }
+    else {
+      $response->setStatus( SSH2_FX_FAILURE );
     }
   }
-  $self->sendStatus( $id, $status );
 }
 #-------------------------------------------------------------------------------
 sub processReaddir {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id      = $payload->getInt();
-  my $handle  = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    handle  => 'string',
+  );
 
-  logDetail(sprintf("processReaddir: readdir id %u handle %d", $id, $handle));
+  $self->logAction();
 
-  return if $self->denyOperation(SSH2_FXP_READDIR, $id);
+  return if $self->denyOperation(SSH2_FXP_READDIR, $response);
 
-  my $dirp = $self->getHandle($handle, 'dir');
+  my $dirp = $self->getHandle($payload, 'dir');
   if (not defined $dirp) {
-    $self->sendStatus( $id, SSH2_FX_FAILURE );
+    $response->setStatus( SSH2_FX_FAILURE );
   }
   else {
     my $fullpath = $dirp->getPath();
     my $stats = [];
     my $count = 0;
-    while (my $dp = readdir($dirp)) {
+    while (my $dp = $dirp->readdir()) {
       my $pathname = $fullpath . $dp;
-      next if ( $self->{no_symlinks} and -l $pathname ); # we only inform the user about files and directories
-      my @st = lstat($pathname);
+      next if ( $self->{no_symlinks} and $self->{FS}->IsSymlink( $pathname ) ); # we only inform the user about files and directories
+    my @st = $self->{FS}->LStat($pathname);
       next unless scalar @st;
       my $file = {};
       $file->{attrib} = $self->statToAttrib(@st);
@@ -874,12 +1077,11 @@ sub processReaddir {
       #/* XXX check packet size instead */
       last if $count == 100;
     }
-
     if ($count > 0) {
-      $self->sendNames($id, $stats);
+      $response->setNames($stats);
     }
     else {
-      $self->sendStatus( $id, SSH2_FX_EOF );
+      $response->setStatus( SSH2_FX_EOF );
     }
   }
 }
@@ -887,174 +1089,194 @@ sub processReaddir {
 sub processRemove {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id      = $payload->getInt();
-  my $name    = $payload->getString();
-  my $filename = $self->makeSafeFileName($name);
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+  );
 
-  logGeneral sprintf("processRemove: remove id %u name %s", $id, $name);
+  $self->logAction();
 
-  return if $self->denyOperation(SSH2_FXP_REMOVE, $id);
+  my $filename = $self->makeSafeFileName($req->{name});
 
-  if ((not defined $filename) or ($self->{no_symlinks} and -l $self->{home_dir} . $filename)){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+  logDetail sprintf("processRemove: remove id %u name %s", $req->{id}, $req->{name});
+
+  return if $self->denyOperation(SSH2_FXP_REMOVE, $response);
+
+  if ((not defined $filename) or ($self->{no_symlinks} and $self->{FS}->IsSymlink( $filename ))){
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
 
-  my $ret = unlink($self->{home_dir} . $filename);
-  my $status = $ret ? $self->errnoToPortable($!+0) : SSH2_FX_OK;
+  my $ret = $self->{FS}->Unlink($filename);
+  my $status = $ret ?  SSH2_FX_OK : $self->errnoToPortable($!+0);
   if ( $status == SSH2_FX_OK ){
-    logGeneral "Removed $self->{home_dir}$filename";
+    logGeneral "Removed $filename";
   }
-  $self->sendStatus($id, $status);
+  $response->setStatus( $status );
 }
 #-------------------------------------------------------------------------------
 sub processMkdir {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $name     = $payload->getString();
-  my $filename = $self->makeSafeFileName($name);
-  my $attr     = $payload->getAttrib();
 
-  my $mode = defined $self->{dir_perms}                         ? $self->{dir_perms}   :
-             ($attr->{flags} & SSH2_FILEXFER_ATTR_PERMISSIONS)  ? $attr->{perm} & 0777 : 0777;
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+    attr    => 'attrib',
+  );
 
-  logGeneral sprintf("processMkdir: mkdir id %u name %s mode 0%o", $id, $name, $mode);
+  my $filename = $self->makeSafeFileName($req->{name});
 
-  return if $self->denyOperation(SSH2_FXP_MKDIR, $id);
+  my $mode = defined $self->{dir_perms}                              ? $self->{dir_perms}        :
+             ($req->{attr}{flags} & SSH2_FILEXFER_ATTR_PERMISSIONS)  ? $req->{attr}{perm} & 0777 : 0777;
+
+  $self->logAction();
+
+  return if $self->denyOperation(SSH2_FXP_MKDIR, $response);
 
   if (not defined $filename){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
 
-  my $ret = mkdir($self->{home_dir} . $filename, $mode);
-  my $status = $ret ? $self->errnoToPortable($!+0) : SSH2_FX_OK;
-  $self->sendStatus($id, $status);
+  my $ret = $self->{FS}->Mkdir($filename, $mode);
+  $response->setStatus( $ret ? SSH2_FX_OK : $self->errnoToPortable($!+0) );
 }
 #-------------------------------------------------------------------------------
 sub processRmdir {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $name     = $payload->getString();
-  my $filename = $self->makeSafeFileName($name);
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+  );
 
-  logGeneral sprintf("processRmdir: rmdir id %u name %s", $id, $name);
+  my $filename = $self->makeSafeFileName($req->{name});
 
-  return if $self->denyOperation(SSH2_FXP_RMDIR, $id);
+  $self->logAction();
+
+  return if $self->denyOperation(SSH2_FXP_RMDIR, $response);
 
   if (not defined $filename){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
 
-  my $ret = rmdir($self->{home_dir} . $filename);
-  my $status = $ret ? $self->errnoToPortable($!+0) : SSH2_FX_OK;
-  $self->sendStatus($id, $status);
+  my $ret = $self->{FS}->Rmdir($filename);
+  $response->setStatus( $ret ? SSH2_FX_OK : $self->errnoToPortable($!+0) );
 }
 #-------------------------------------------------------------------------------
 sub processRealpath {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $name     = $payload->getString();
-  my $path     = $self->makeSafeFileName($name);
+  my $req = $payload->getPayloadContent(
+    name    => 'string',
+  );
 
-  logDetail sprintf("processRealpath: realpath id %u path %s", $id, $name);
+  $self->logAction();
+
+  my $path     = $self->makeSafeFileName($req->{name});
+
+  logDetail sprintf("processRealpath: realpath id %u path %s", $req->{id}, $req->{name});
 
   my $file = { name => $path, long_name => $path, attrib => { flags => 0 } };
-  $self->sendNames($id, [ $file ]);
+
+  $response->setNames( $file );
 }
 #-------------------------------------------------------------------------------
 sub processRename {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $oname    = $payload->getString();
-  my $oldpath  = $self->makeSafeFileName($oname);
-  my $nname    = $payload->getString();
-  my $newpath  = $self->makeSafeFileName($nname);
+  my $req = $payload->getPayloadContent(
+    source_name  => 'string',
+    target_name  => 'string',
+  );
 
-  logGeneral sprintf("processRename: rename id %u old %s new %s", $id, $oname, $nname);
+  my $oldpath  = $self->makeSafeFileName($req->{source_name});
+  my $newpath  = $self->makeSafeFileName($req->{target_name});
 
-  return if $self->denyOperation(SSH2_FXP_RENAME, $id);
+  $self->logAction();
 
-  if ((not defined $oldpath or not defined $newpath) or ($self->{no_symlinks} and -l $self->{home_dir} . $oldpath)){
-    $self->sendStatus( $id, SSH2_FX_NO_SUCH_FILE );
+  return if $self->denyOperation(SSH2_FXP_RENAME, $response);
+
+  if ((not defined $oldpath or not defined $newpath) or ($self->{no_symlinks} and $self->{FS}->IsSymlink( $oldpath ) )){
+    $response->setStatus( SSH2_FX_NO_SUCH_FILE );
     return;
   }
 
-  return if -d $self->{home_dir} . $oldpath and $self->denyOperation(NET_SFTP_RENAME_DIR, $id);
+  return if $self->{FS}->IsDir( $oldpath ) and $self->denyOperation(NET_SFTP_RENAME_DIR, $response);
 
-  my $status = SSH2_FX_FAILURE;
-
-  if (-f $self->{home_dir} . $oldpath) {
+  if ( $self->{FS}->IsFile( $oldpath )) {
     #/* Race-free rename of regular files */
-    if (! link($self->{home_dir} . $oldpath, $self->{home_dir} . $newpath)) {#FIXME test all codepaths
+    if (! $self->{FS}->Link( $oldpath,  $newpath)) {#FIXME test all codepaths
       # link method failed - try just a rename
-      if (! rename($self->{home_dir} . $oldpath,$self->{home_dir} . $newpath)){
-        $status = $self->errnoToPortable($!+0);
+      if (! $self->{FS}->Rename($oldpath, $newpath)){
+        $response->setStatus($self->errnoToPortable($!+0));
       }
       else {
-        $status = SSH2_FX_OK;
+        $response->setStatus(SSH2_FX_OK);
       }
     }
-    elsif (! unlink($self->{home_dir} . $oldpath)) {
-      $status = $self->errnoToPortable($!+0);
+    elsif (! $self->{FS}->Unlink($oldpath)) {
+      $response->setStatus( $self->errnoToPortable($!+0) );
       #/* clean spare link */
-      unlink($self->{home_dir} . $newpath);
+      $self->{FS}->Unlink($newpath);
     }
     else {
-      $status = SSH2_FX_OK;
+      $response->setStatus(SSH2_FX_OK);
     }
   }
-  elsif ( -d $self->{home_dir} . $oldpath ) {
-    if (! rename($self->{home_dir} . $oldpath,$self->{home_dir} . $newpath)){
-      $status = $self->errnoToPortable($!+0);
+  elsif ( $self->{FS}->IsDir( $oldpath ) ) {
+    if (! $self->{FS}->Rename($oldpath, $newpath)){
+      $response->setStatus($self->errnoToPortable($!+0));
     }
     else {
-      $status = SSH2_FX_OK;
+      $response->setStatus(SSH2_FX_OK);
     }
   }
   else {
     # File does not exist or is a symlink - deny all knowlege
-    $status = SSH2_FX_NO_SUCH_FILE;
+    $response->setStatus(SSH2_FX_NO_SUCH_FILE);
   }
-  if ( $status == SSH2_FX_OK ){
-    logGeneral "Renamed $self->{home_dir}$oldpath to $self->{home_dir}$newpath";
-  }
-  $self->sendStatus($id, $status);
 }
 #-------------------------------------------------------------------------------
 sub processReadlink {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $name     = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    name     => 'string',
+  );
 
-  $self->sendStatus($id, SSH2_FX_NO_SUCH_FILE); # all symlinks hidden
+  $self->logAction();
+
+  $response->setStatus(SSH2_FX_NO_SUCH_FILE); # all symlinks hidden
 }
 #-------------------------------------------------------------------------------
 sub processSymlink {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $oname    = $payload->getString();
-  my $oldpath  = $self->makeSafeFileName($oname);
-  my $nname    = $payload->getString();
-  my $newpath  = $self->makeSafeFileName($nname);
+  my $req = $payload->getPayloadContent(
+    source_name  => 'string',
+    target_name  => 'string',
+  );
 
-  logDetail sprintf ("symlink id %u old %s new %s", $id, $oname, $nname);
+  my $oldpath  = $self->makeSafeFileName($req->{source_name});
+  my $newpath  = $self->makeSafeFileName($req->{target_name});
 
-  return if $self->denyOperation(SSH2_FXP_SYMLINK, $id);
+  $self->logAction();
+
+  return if $self->denyOperation(SSH2_FXP_SYMLINK, $response);
 
   logError "processSymlink not implemented";
 }
@@ -1062,38 +1284,28 @@ sub processSymlink {
 sub processExtended {
   my $self = shift;
   my $payload = shift;
+  my $response = shift;
 
-  my $id       = $payload->getInt();
-  my $request = $payload->getString();
+  my $req = $payload->getPayloadContent(
+    request  => 'string',
+  );
 
-  $self->sendStatus($id, SSH2_FX_OP_UNSUPPORTED);    #/* MUST */
-}
-#-------------------------------------------------------------------------------
-sub sendNames {
-  my $self = shift;
-  my $id = shift;
-  my $stats = shift;
+  $self->logAction();
 
-  my $msg = pack('CNN', SSH2_FXP_NAME, $id, scalar @$stats );
-  logDetail sprintf ("sent names id %u count %d", $id, scalar @$stats);
-  for my $file (@$stats) {
-    $msg .= pack('N', length $file->{name})      . $file->{name};
-    $msg .= pack('N', length $file->{long_name}) . $file->{long_name};
-    $msg .= $self->encodeAttrib($file->{attrib});
-  }
-  $self->sendMessage($msg);
+  $response->setStatus( SSH2_FX_OP_UNSUPPORTED );    #/* MUST */
 }
 #-------------------------------------------------------------------------------
 sub denyOperation {
   my $self = shift;
-  my ($op, $id) = @_;
+  my ($op, $response) = @_;
   if (defined $self->{deny}{$op} and $self->{deny}{$op}){
-    logWarning "Denying request operation: " . MESSAGE_TYPES->{$op} . ", id: $id";
-    my $status = SSH2_FX_PERMISSION_DENIED;
+    logWarning "Denying request operation: " . MESSAGE_TYPES->{$op} . ", id: " . $response->getId();
     if (defined $self->{fake_ok}{$op} and $self->{fake_ok}{$op}){
-      $status = SSH2_FX_OK;
+      $response->setStatus( SSH2_FX_OK );
     }
-    $self->sendStatus($id, $status);
+    else {
+      $response->setStatus( SSH2_FX_PERMISSION_DENIED );
+    }
     return 1;
   }
   return;
@@ -1123,37 +1335,6 @@ sub lsFile {
   return sprintf("%s %3u %-*s %-*s %8llu %s %s", $mode, $st->[3], $ulen, $user, $glen, $group, $st->[7], $sz, $name);
 }
 #-------------------------------------------------------------------------------
-sub sendStatus {
-  my $self = shift;
-  my ($id, $status) = @_;
-  my @status_message = (
-    "Success",                #/* SSH_FX_OK */
-    "End of file",            #/* SSH_FX_EOF */
-    "No such file",            #/* SSH_FX_NO_SUCH_FILE */
-    "Permission denied",      #/* SSH_FX_PERMISSION_DENIED */
-    "Failure",                #/* SSH_FX_FAILURE */
-    "Bad message",            #/* SSH_FX_BAD_MESSAGE */
-    "No connection",          #/* SSH_FX_NO_CONNECTION */
-    "Connection lost",        #/* SSH_FX_CONNECTION_LOST */
-    "Operation unsupported",  #/* SSH_FX_OP_UNSUPPORTED */
-    "Unknown error"            #/* Others */
-  );
-
-  my $sub  = [caller(1)]->[3]; # Get the sub that called me
-  if ($status != SSH2_FX_OK and $status != SSH2_FX_EOF ){
-    logGeneral "result: process: $sub  status: $status_message[$status]  id: $id";
-  }
-  else {
-    logDetail  "result: process: $sub  status: $status_message[$status]  id: $id";
-  }
-
-  my $msg = pack('CNN', SSH2_FXP_STATUS, $id, $status);
-  if ($self->{client_version} >= 3){
-    $msg .= pack('N', length $status_message[$status]) . $status_message[$status] . pack('N', 0);
-  }
-  $self->sendMessage( $msg );
-}
-#-------------------------------------------------------------------------------
 sub makeSafeFileName {
   my $self = shift;
   # We force all file names to be treated as from / which we treat as the users home directory
@@ -1179,14 +1360,14 @@ sub makeSafeFileName {
       push @newpath, $d;
     }
     if ($self->{no_symlinks}){
-      if ( -l $self->{home_dir} . join('/', @newpath) ){
+      if ( $self->{FS}->IsSymlink( join('/', @newpath) ) ){
         return; # no symlinks
       }
     }
   }
 
   $name = join('/', @newpath) || '/';
-  $name =~ s!/.$!/!;
+  $name =~ s!/\.$!/!;
   return $name;
 }
 #-------------------------------------------------------------------------------
@@ -1266,6 +1447,7 @@ sub errnoToPortable {
   my $errno = shift;
 
   if ($errno == 0){
+    logWarning "Good error code received by errnoToPortable";
     return SSH2_FX_OK;
   }
   elsif ( $errno ==  ENOENT or
@@ -1312,6 +1494,48 @@ sub new {
   my %arg = @_;
   $self->{data} = $arg{data};
   return $self;
+}
+#-------------------------------------------------------------------------------
+sub asString {
+  my $self = shift;
+
+  my @strings;
+  push @strings, length $self->{data} . " bytes left to decode";
+  push @strings, "Decoded: ";
+  for my $key ( sort keys %{$self->{_decoded_data}} ){
+    if ($key eq 'data' and $self->{_decoded_data}{data} !~ /^[\s\w]*$/){
+      push @strings, "$key\t\t=><Binary data>";
+    }
+    else {
+      push @strings, "$key\t\t=>$self->{_decoded_data}{$key}";
+    }
+  }
+
+  return join("\n", @strings)
+}
+# ------------------------------------------------------------------------------
+sub getPayloadContent {
+  my $self = shift;
+
+  while ( my $name = shift and my $type = shift ){
+    if ($type eq 'int'){
+      $self->{_decoded_data}{$name} = $self->getInt();
+    }
+    elsif ($type eq 'int64'){
+      $self->{_decoded_data}{$name} = $self->getInt64();
+    }
+    elsif ($type eq 'char'){
+      $self->{_decoded_data}{$name} = $self->getChar();
+    }
+    elsif ($type eq 'string'){
+      $self->{_decoded_data}{$name} = $self->getString();
+    }
+    elsif ($type eq 'attrib'){
+      $self->{_decoded_data}{$name} = $self->getAttrib();
+    }
+  }
+
+  return $self->{_decoded_data};
 }
 # ------------------------------------------------------------------------------
 sub getInt {
@@ -1371,7 +1595,7 @@ sub getAttrib {
     my $count = $self->getInt();
     for (my $i = 0; $i < $count; $i++) {
       my $type = $self->getString();
-      my $data = $self->getString();
+      my $req = $self->getString();
       logDetail("Got file attribute \"%s\"", $type);
     }
   }
@@ -1383,7 +1607,317 @@ sub done {
   return 1 if length $self->{data} eq 0;
   return;
 }
+#-------------------------------------------------------------------------------
+sub setFileType {
+  my $self = shift;
+  $self->{file_type} = shift;
+}
+#-------------------------------------------------------------------------------
+sub getFileType {
+  my $self = shift;
+  return $self->{file_type};
+}
+#-------------------------------------------------------------------------------
+sub setFilename {
+  my $self = shift;
+  $self->{filename} = shift;
+}
+#-------------------------------------------------------------------------------
+sub getFilename {
+  my $self = shift;
+  return $self->{filename};
+}
 1;
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+package Net::SFTP::SftpServer::Response;
+use strict;
+use warnings;
+
+#/* server to client */
+use constant SSH2_FXP_VERSION               => 2;
+use constant SSH2_FXP_STATUS                => 101;
+use constant SSH2_FXP_HANDLE                => 102;
+use constant SSH2_FXP_DATA                  => 103;
+use constant SSH2_FXP_NAME                  => 104;
+use constant SSH2_FXP_ATTRS                 => 105;
+
+1;
+#-------------------------------------------------------------------------------
+sub new {
+  my $class = shift;
+  my $self  = {};
+  bless $self, $class;
+  return $self;
+}
+#-------------------------------------------------------------------------------
+sub asString {
+  my $self = shift;
+
+  my @strings;
+  for my $key ( sort keys %$self ){
+    if ($key eq 'data' and $self->{data} !~ /^[\s\w]*$/){
+      push @strings, "$key\t\t=><Binary data>";
+    }
+    else {
+      push @strings, "$key\t\t=>$self->{$key}";
+    }
+  }
+
+  return join("\n", @strings)
+}
+#-------------------------------------------------------------------------------
+sub setId {
+  my $self = shift;
+  $self->{id} = shift;
+}
+#-------------------------------------------------------------------------------
+sub getId {
+  my $self = shift;
+  return $self->{id};
+}
+#-------------------------------------------------------------------------------
+sub getType {
+  my $self = shift;
+  return $self->{type};
+}
+#-------------------------------------------------------------------------------
+sub setStatus {
+  my $self = shift;
+  $self->{status} = shift;
+  $self->{type} = SSH2_FXP_STATUS;
+}
+#-------------------------------------------------------------------------------
+sub getStatus {
+  my $self = shift;
+  return $self->{status};
+}
+#-------------------------------------------------------------------------------
+sub setData {
+  my $self = shift;
+  $self->{data_length} = shift;
+  $self->{data} = shift;
+  $self->{type} = SSH2_FXP_DATA;
+}
+#-------------------------------------------------------------------------------
+sub getData {
+  my $self = shift;
+  return $self->{data};
+}
+#-------------------------------------------------------------------------------
+sub getDataLength {
+  my $self = shift;
+  return $self->{data_length};
+}
+#-------------------------------------------------------------------------------
+sub setHandle {
+  my $self = shift;
+  $self->{handle} = shift;
+  $self->{type} = SSH2_FXP_HANDLE;
+}
+#-------------------------------------------------------------------------------
+sub getHandle {
+  my $self = shift;
+  return $self->{handle};
+}
+#-------------------------------------------------------------------------------
+sub setNames {
+  my $self = shift;
+  $self->{names} = shift;
+  $self->{names} = [ $self->{names} ] unless ref $self->{names} eq 'ARRAY';
+  $self->{type} = SSH2_FXP_NAME;
+}
+#-------------------------------------------------------------------------------
+sub getNames {
+  my $self = shift;
+  return $self->{names};
+}
+#-------------------------------------------------------------------------------
+sub setInitVersion {
+  my $self = shift;
+  $self->{version} = shift;
+  $self->{type} = SSH2_FXP_VERSION;
+}
+#-------------------------------------------------------------------------------
+sub getVersion {
+  my $self = shift;
+  return $self->{version};
+}
+#-------------------------------------------------------------------------------
+sub setAttrs {
+  my $self = shift;
+  $self->{attr} = shift;
+  $self->{type} = SSH2_FXP_ATTRS;
+}
+#-------------------------------------------------------------------------------
+sub getAttrs {
+  my $self = shift;
+  return $self->{attr};
+}
+1;
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+package Net::SFTP::SftpServer::FS;
+
+no strict;
+
+use Exporter qw( import );
+
+@EXPORT = qw(
+  setChrootDir
+);
+
+use strict;
+use warnings;
+
+{
+  my %callback_of;
+
+  my $chroot_dir = '';
+
+  #-------------------------------------------------------------------------------
+  sub new {
+    my $class = shift;
+    my $self  = bless \do{my $anon}, $class;
+    return unless $self->initialise( @_ ); # Dont keep the object unless we initialise sucessfully
+
+    my $ident = scalar $self;
+
+    $callback_of{$ident} = 0;
+
+    return $self;
+  }
+  #-------------------------------------------------------------------------------
+  sub initialise {
+    return 1;
+  }
+  #-------------------------------------------------------------------------------
+  sub setChrootDir {
+    my $self = shift;
+    $chroot_dir = shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub IsSymlink {
+    my $self = shift;
+    return -l $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Exists {
+    my $self = shift;
+    return -e $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub IsFile {
+    my $self = shift;
+    return -f $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub IsDir {
+    my $self = shift;
+    return -d $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub ZeroSize {
+    my $self = shift;
+    return -z $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Link {
+    my $self = shift;
+    return link( $chroot_dir . shift, $chroot_dir . shift);
+  }
+  #-------------------------------------------------------------------------------
+  sub LStat {
+    my $self = shift;
+    return lstat $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Stat {
+    my $self = shift;
+    return stat $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Size {
+    my $self = shift;
+    return -s $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Unlink {
+    my $self = shift;
+    return unlink $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Mkdir {
+    my $self = shift;
+    return mkdir( $chroot_dir . shift, shift);
+  }
+  #-------------------------------------------------------------------------------
+  sub Rmdir {
+    my $self = shift;
+    return rmdir $chroot_dir . shift;
+  }
+  #-------------------------------------------------------------------------------
+  sub Rename {
+    my $self = shift;
+    my ($old, $new) = @_;
+    return rename( $chroot_dir . $old, $chroot_dir . $new);
+  }
+  #-------------------------------------------------------------------------------
+  sub chrootDir {
+    my $self = shift;
+    return $chroot_dir;
+  }
+  #-------------------------------------------------------------------------------
+  sub setCallback {
+    my $self = shift;
+    my $ident = scalar($self);
+    $callback_of{$ident} = 1;
+  }
+  #-------------------------------------------------------------------------------
+  sub callback {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $callback_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub DESTROY {
+    my $self = shift;
+    my $ident = scalar($self);
+    delete $callback_of{$ident};
+  }
+}
+1;
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+package Net::SFTP::SftpServer::FileChrootBroken;
+
+use strict;
+use warnings;
+
+our $AUTOLOAD;
+
+sub AUTOLOAD {
+  my $self = shift;
+
+  my $method = $AUTOLOAD;
+  $method =~ m/.+::(.+)(?!::)/;
+  $method = $1 if $1;
+
+  Net::SFTP::SftpServer::logError "$method is not supported after chroot is broken";
+
+  return;
+}
 #-------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------
@@ -1393,226 +1927,439 @@ package Net::SFTP::SftpServer::File;
 use strict;
 use warnings;
 
-use base qw( IO::File );
+use IO::File;
+use File::Basename;
+use Fcntl qw( O_RDWR O_CREAT O_TRUNC O_EXCL O_RDONLY O_WRONLY SEEK_SET );
 
-my $TMP_EXT = ".SftpXFR.$$";
+use base qw( Net::SFTP::SftpServer::FS );
 
-my %filename_of;
-my %mode_of;
-my %perm_of;
-my %write_of;
-my %read_of;
-my %opentime_of;
-my %use_temp_of;
-my %err_of;
-#-------------------------------------------------------------------------------
-sub new {
-  my $type = shift;
-  my $class = ref($type) || $type || "Net::SFTP::SftpServer::File";
-  my ($filename, $mode, $perm, $use_tmp) = @_;
-  $use_tmp ||= 0;
-  my $realfile = $filename;
-  if ($use_tmp){
-    $filename .= $TMP_EXT;
-  }
+{
+  my $TMP_EXT = ".SftpXFR.$$";
 
-  my $fd = $class->SUPER::new($filename, $mode, $perm);
+  my %fh_of;
+  my %filename_of;
+  my %mode_of;
+  my %perm_of;
+  my %write_of;
+  my %read_of;
+  my %opentime_of;
+  my %use_temp_of;
+  my %err_of;
+  my %state_of;
 
-  return unless defined $fd;
+  #-------------------------------------------------------------------------------
+  sub initialise {
+    my $self = shift;
 
-  my $ident = scalar($fd);
-  $filename_of{$ident} = $realfile;
-  $mode_of{$ident}     = $mode;
-  $perm_of{$ident}     = $perm;
-  $write_of{$ident}    = 0;
-  $read_of{$ident}     = 0;
-  $opentime_of{$ident} = time();
-  $use_temp_of{$ident} = $use_tmp;
+    my ($filename, $mode, $perm, $use_tmp) = @_;
 
-  return $fd;
-}
-#-------------------------------------------------------------------------------
-sub err {
-  my $fd = shift;
-  my $ident = scalar($fd);
+    $use_tmp ||= 0;
+    my $realfile = $filename;
+    if ($use_tmp){
+      $filename .= $TMP_EXT;
+    }
 
-  return $err_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub close {
-  my $fd = shift;
-  my $ident = scalar($fd);
+    my $fd = IO::File->new($self->chrootDir . $filename, $mode, $perm);
 
-  my $ret = $fd->SUPER::close();
-  unless ($ret){
-    $err_of{$ident} = $!+0;
-  }
+    return unless defined $fd;
 
-  if ($use_temp_of{$ident}){
-    rename $filename_of{$ident} . $TMP_EXT, $filename_of{$ident};
-  }
+    my $ident = scalar($self);
+    $filename_of{$ident} = $realfile;
+    $fh_of{$ident}       = $fd;
+    $mode_of{$ident}     = $mode;
+    $perm_of{$ident}     = $perm;
+    $write_of{$ident}    = 0;
+    $read_of{$ident}     = 0;
+    $opentime_of{$ident} = time();
+    $use_temp_of{$ident} = $use_tmp;
+    $state_of{$ident}    = 'open';
 
-  return $ret;
-}
-#-------------------------------------------------------------------------------
-sub getFilename {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  return $filename_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub getMode {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  return $mode_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub getPerm {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  return $perm_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub wroteBytes {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  my $size = shift;
-  $write_of{$ident} += $size;
-}
-#-------------------------------------------------------------------------------
-sub readBytes {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  my $size = shift;
-  $read_of{$ident} += $size;
-}
-#-------------------------------------------------------------------------------
-sub getWrittenBytes {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  return $write_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub getReadBytes {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  $read_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub getStats {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  my $stats = "Filename: $filename_of{$ident} ";
-  my $dtime = (time() - $opentime_of{$ident}) || 1;
-  if ($write_of{$ident} and $read_of{$ident}){
-    ## reads and writes
-    my $speed = int(($write_of{$ident} + $read_of{$ident}) / (1024 * $dtime));
-    $stats .= "Received: $write_of{$ident} bytes Sent: $read_of{$ident} in $dtime seconds Speed: $speed K/s";
-  }
-  elsif ($write_of{$ident}){
-    # File received
-    my $speed = int($write_of{$ident} / (1024 * $dtime));
-    $stats .= "Received: $write_of{$ident} bytes in $dtime seconds Speed: $speed K/s";
-  }
-  elsif ($read_of{$ident}){
-    # File Sent
-    my $speed = int($read_of{$ident} / (1024 * $dtime));
-    $stats .= "Sent: $read_of{$ident} bytes in $dtime seconds Speed: $speed K/s";
-  }
-  else {
-    $stats .= "No data sent or received";
-  }
-  return $stats;
-}
-#-------------------------------------------------------------------------------
-sub wasReceived {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  if ($write_of{$ident} and ! $read_of{$ident} and -s $filename_of{$ident} eq $write_of{$ident}){
     return 1;
   }
-  return;
-}
-#-------------------------------------------------------------------------------
-sub wasSent {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  if ($read_of{$ident} and ! $write_of{$ident} and -s $filename_of{$ident} eq $read_of{$ident}){
-    return 1;
+  #-------------------------------------------------------------------------------
+  sub err {
+    my $self = shift;
+    my $ident = scalar($self);
+
+    return $err_of{$ident};
   }
-  return;
-}
-#-------------------------------------------------------------------------------
-sub getType {
-  my $fd = shift;
-  return 'file';
+  #-------------------------------------------------------------------------------
+  sub close {
+    my $self = shift;
+    my $ident = scalar($self);
+    my $ret = $fh_of{$ident}->close();
+    unless ($ret){
+      $err_of{$ident} = $!+0;
+    }
+
+    if ($use_temp_of{$ident}){
+      $self->Rename( $filename_of{$ident} . $TMP_EXT, $filename_of{$ident} );
+      $use_temp_of{$ident} = 0;
+    }
+
+    $state_of{$ident}    = 'closed';
+    return $ret;
+  }
+  #-------------------------------------------------------------------------------
+  sub getFilename {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $filename_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub getMode {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $mode_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub getPerm {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $perm_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub wroteBytes {
+    my $self = shift;
+    my $ident = scalar($self);
+    my $size = shift;
+    $write_of{$ident} += $size;
+  }
+  #-------------------------------------------------------------------------------
+  sub readBytes {
+    my $self = shift;
+    my $ident = scalar($self);
+    my $size = shift;
+    $read_of{$ident} += $size;
+  }
+  #-------------------------------------------------------------------------------
+  sub getWrittenBytes {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $write_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub getReadBytes {
+    my $self = shift;
+    my $ident = scalar($self);
+    $read_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub getStats {
+    my $self = shift;
+    my $ident = scalar($self);
+    my $stats = "Filename: $filename_of{$ident} ";
+    my $dtime = (time() - $opentime_of{$ident}) || 1;
+    if ($write_of{$ident} and $read_of{$ident}){
+      ## reads and writes
+      my $speed = int(($write_of{$ident} + $read_of{$ident}) / (1024 * $dtime));
+      $stats .= "Received: $write_of{$ident} bytes Sent: $read_of{$ident} in $dtime seconds Speed: $speed K/s";
+    }
+    elsif ($write_of{$ident}){
+      # File received
+      my $speed = int($write_of{$ident} / (1024 * $dtime));
+      $stats .= "Received: $write_of{$ident} bytes in $dtime seconds Speed: $speed K/s";
+    }
+    elsif ($read_of{$ident}){
+      # File Sent
+      my $speed = int($read_of{$ident} / (1024 * $dtime));
+      $stats .= "Sent: $read_of{$ident} bytes in $dtime seconds Speed: $speed K/s";
+    }
+    else {
+      $stats .= "No data sent or received";
+    }
+    return $stats;
+  }
+  #-------------------------------------------------------------------------------
+  sub wasReceived {
+    my $self = shift;
+    my $ident = scalar($self);
+    if ($write_of{$ident} and ! $read_of{$ident} and $self->Size( $filename_of{$ident} ) eq $write_of{$ident}){
+      return 1;
+    }
+    return;
+  }
+  #-------------------------------------------------------------------------------
+  sub wasSent {
+    my $self = shift;
+    my $ident = scalar($self);
+    if ($read_of{$ident} and ! $write_of{$ident} and $self->Size( $filename_of{$ident} ) eq $read_of{$ident}){
+      return 1;
+    }
+    return;
+  }
+  #-------------------------------------------------------------------------------
+  sub getType {
+    my $self = shift;
+    return 'file';
+  }
+  #-------------------------------------------------------------------------------
+  sub sysread {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $fh_of{$ident}->sysread( @_ );
+  }
+  #-------------------------------------------------------------------------------
+  sub syswrite {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $fh_of{$ident}->syswrite( @_ );
+  }
+  #-------------------------------------------------------------------------------
+  sub sysseek {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $fh_of{$ident}->sysseek( @_ );
+  }
+  #-------------------------------------------------------------------------------
+  sub read {
+    my $self = shift;
+    my $ident = scalar($self);
+    unless ( $self->callback ){
+      Net::SFTP::SftpServer::logError "read method called outside from callback";
+      return;
+    }
+
+    if ($state_of{$ident} ne 'open'){
+      $fh_of{$ident}->open( $self->chrootDir . $filename_of{$ident}, '<' );
+      $state_of{$ident} = 'open';
+    }
+    return $fh_of{$ident}->read( @_ );
+  }
+  #-------------------------------------------------------------------------------
+  sub open {
+    my $self = shift;
+    my $ident = scalar($self);
+    unless ( $self->callback ){
+      Net::SFTP::SftpServer::logError "open method called outside from callback";
+      return;
+    }
+
+    if ($state_of{$ident} ne 'open'){
+      my $ret = $fh_of{$ident}->open( $self->chrootDir . $filename_of{$ident}, @_ );
+      $state_of{$ident} = 'open';
+      return $ret;
+    }
+  }
+  #-------------------------------------------------------------------------------
+  sub moveToProcessed {
+    my $self = shift;
+    my %arg = @_;
+
+    my $ident = scalar $self;
+
+    if ($arg{BREAKCHROOT}){
+      return $self->moveToProcessedBREAKCHROOT( @_ );
+    }
+
+    $arg{dst}         ||= 'processed';
+    $arg{dir_perms}   ||= 0770;
+
+    unless ($self->Exists($filename_of{$ident})){
+      Net::SFTP::SftpServer::logWarning "moveToProcessed: File $filename_of{$ident} does not exist";
+      return;
+    }
+
+
+    if ($filename_of{$ident} =~ m!/$arg{dst}/!){
+      # file is already in a processed directory
+      return;
+    }
+
+    if ($arg{filename_condition}){
+      return unless ($filename_of{$ident} =~ m/$arg{filename_condition}/ );
+    }
+
+    my $dir = dirname($filename_of{$ident});
+    if (! $self->Exists( "$dir/processed" )){
+      unless ($self->Mkdir( "$dir/processed", $arg{dir_perms} )){
+        Net::SFTP::SftpServer::logWarning "moveToProcessed: failed to mkdir $dir/processed";
+        return;
+      }
+    }
+    elsif (! $self->IsDir( "$dir/processed") ){
+      Net::SFTP::SftpServer::logWarning "moveToProcessed: $dir/processed exists but is not a directory";
+      return;
+    }
+
+    my $name = fileparse($filename_of{$ident});
+    if ( $self->Exists( "$dir/processed/$name" ) ){
+      Net::SFTP::SftpServer::logWarning "moveToProcessed: cannot move $filename_of{$ident} - $dir/processed/$name already exists";
+      return;
+    }
+
+    unless ($self->Rename( $filename_of{$ident}, "$dir/processed/$name" )){
+      Net::SFTP::SftpServer::logWarning "moveToProcessed: failed to rename $filename_of{$ident} to $dir/processed/$name";
+      return;
+    }
+
+    $filename_of{$ident} = "$dir/processed/$name";
+
+    Net::SFTP::SftpServer::logGeneral "moveToProcessed: moved $filename_of{$ident} to $dir/processed/$name";
+  }
+  #-------------------------------------------------------------------------------
+  sub moveToProcessedBREAKCHROOT {
+    my $self = shift;
+    my %arg = @_;
+
+    my $ident = scalar $self;
+
+    unless ( -d $arg{dst} and -w $arg{dst} ){
+      Net::SFTP::SftpServer::logWarning "Cannot write to target directory $arg{dst}";
+      return;
+    }
+
+    unless ($self->Exists($filename_of{$ident})){
+      Net::SFTP::SftpServer::logWarning "moveToProcessed: File $filename_of{$ident} does not exist";
+      return;
+    }
+
+    if ($arg{filename_condition}){
+      return unless ($filename_of{$ident} =~ m/$arg{filename_condition}/ );
+    }
+
+    my $name = fileparse($filename_of{$ident});
+
+    bless $self, 'Net::SFTP::SftpServer::FileChrootBroken';
+
+    $self->renameBREADCHROOT( $arg{dst} . "/$name" );
+
+    Net::SFTP::SftpServer::logGeneral "moveToProcessed: moved $filename_of{$ident} to $arg{dst}/$name";
+  }
+  #-------------------------------------------------------------------------------
+  sub getFullFilenameBREAKCHROOT {
+    my $self = shift;
+    my $ident = scalar $self;
+
+    my $chroot_dir = $self->chrootDir;
+
+    bless $self, 'Net::SFTP::SftpServer::FileChrootBroken';
+
+    return $chroot_dir . $filename_of{$ident}
+  }
+  #-------------------------------------------------------------------------------
+  sub renameBREAKCHROOT {
+    my $self = shift;
+    my $ident = scalar $self;
+
+    my $newname = shift;
+
+    my $chroot_dir = $self->chrootDir;
+
+    bless $self, 'Net::SFTP::SftpServer::FileChrootBroken';
+
+    return rename $chroot_dir . $filename_of{$ident}, $newname;
+  }
+  #-------------------------------------------------------------------------------
+  sub DESTROY {
+    my $self = shift;
+    my $ident = scalar($self);
+
+    $fh_of{$ident}->close() if defined $fh_of{$ident} and $fh_of{$ident}->opened;
+    delete $fh_of{$ident};
+    delete $filename_of{$ident};
+    delete $mode_of{$ident};
+    delete $perm_of{$ident};
+    delete $write_of{$ident};
+    delete $read_of{$ident};
+    delete $opentime_of{$ident};
+    delete $use_temp_of{$ident};
+    delete $err_of{$ident};
+    delete $state_of{$ident};
+
+    $self->SUPER::DESTROY()
+  }
 }
 1;
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
-#-------------------------------------------------------------------------------
+#-----------------------------------------------------------------------------
+#-----------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
 package Net::SFTP::SftpServer::Dir;
 use strict;
 use warnings;
 
-use base qw( IO::Dir );
+use IO::Dir;
 
-my %path_of;
-my %dir_err_of;
-#-------------------------------------------------------------------------------
-sub new {
-  my $type = shift;
-  my $class = ref($type) || $type || "Net::SFTP::SftpServer::Dir";
-  my $fd = $class->SUPER::new(@_);
+use base qw( Net::SFTP::SftpServer::FS  );
 
-  return unless defined $fd;
+{
+  my %fd_of;
+  my %path_of;
+  my %dir_err_of;
+  #-------------------------------------------------------------------------------
+  sub initialise {
+    my $self = shift;
 
-  my ($path) = @_;
-  $path .= '/';
-  $path =~ s!//$!/!; # make sure we have a trailing /
-  my $ident = scalar($fd);
-  $path_of{$ident} = $path;
+    my ($path) = @_;
 
-  return $fd;
-}
-#-------------------------------------------------------------------------------
-sub err {
-  my $fd = shift;
-  my $ident = scalar($fd);
+    my $fd = IO::Dir->new($self->chrootDir() . $path);
 
-  return $dir_err_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub close {
-  my $fd = shift;
-  my $ident = scalar($fd);
+    return unless defined $fd;
 
-  my $ret = $fd->SUPER::close();
-  unless ($ret){
-    $dir_err_of{$ident} = $!+0;
+    $path .= '/';
+    $path =~ s!//$!/!; # make sure we have a trailing /
+    my $ident = scalar($self);
+    $path_of{$ident} = $path;
+    $fd_of{$ident}   = $fd;
+
+    return 1;
   }
+  #-------------------------------------------------------------------------------
+  sub err {
+    my $self = shift;
+    my $ident = scalar($self);
 
-  return $ret;
-}
-#-------------------------------------------------------------------------------
-sub getFilename {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  return "DIR$path_of{$ident}";
-}
-#-------------------------------------------------------------------------------
-sub getPath {
-  my $fd = shift;
-  my $ident = scalar($fd);
-  return $path_of{$ident};
-}
-#-------------------------------------------------------------------------------
-sub getType {
-  my $fd = shift;
-  return 'dir';
+    return $dir_err_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub close {
+    my $self = shift;
+    my $ident = scalar($self);
+
+    my $ret = $fd_of{$ident}->close();
+    unless ($ret){
+      $dir_err_of{$ident} = $!+0;
+    }
+
+    return $ret;
+  }
+  #-------------------------------------------------------------------------------
+  sub getFilename {
+    my $self = shift;
+    my $ident = scalar($self);
+    return "$path_of{$ident}";
+  }
+  #-------------------------------------------------------------------------------
+  sub getPath {
+    my $self = shift;
+    my $ident = scalar($self);
+    return $path_of{$ident};
+  }
+  #-------------------------------------------------------------------------------
+  sub getType {
+    my $self = shift;
+    return 'dir';
+  }
+  #-------------------------------------------------------------------------------
+  sub readdir {
+    my $self = shift;
+    my $ident = scalar $self;
+    return $fd_of{$ident}->read();
+  }
+  #-------------------------------------------------------------------------------
+  sub DESTROY {
+    my $self = shift;
+    my $ident = scalar($self);
+
+    delete $fd_of{$ident};
+    delete $path_of{$ident};
+    delete $dir_err_of{$ident};
+
+    $self->SUPER::DESTROY()
+  }
 }
 1;
 #-------------------------------------------------------------------------------
@@ -1648,6 +2395,9 @@ Only files and directories are dealt with - other types are not returned on read
 a virtual chroot is performed - / is treated as the users home directory from the
 client perspective and all file access to / will be in /<home_path>/<username>
 home_path is defined on object initialisation not accessed from /etc/passwd
+The script DOES NOT run under chroot - this prevents it needing SUID to start.
+The virtual chroot is enforced by the objects and prevent opperations outside the
+home area
 
 =item *
 
@@ -1655,15 +2405,16 @@ all sym linked files or directories are hidden and not accessible on request
 
 =item *
 
-symlink returns permission denied
+symlink returns permission denied. Please contact me if you need this functionaility implementing
 
 =item *
 
-readlink returns file does not exist
+readlink returns file does not exist. Please contact me if you need this functionaility implementing
 
 =item *
 
-setting of stats (set_stat or set_fstat) is disabled - client will receive permission denied
+setting of stats (set_stat or set_fstat) is disabled - client will receive permission denied.
+Please contact me if you need this functionaility implementing
 
 =item *
 
@@ -1756,6 +2507,24 @@ fake_ok
 
 Array of actions (see action contants in L</PERMISSIONS>) which will be given response SSH2_FX_OK instead of SSH2_FX_PERMISSION_DENIED when denied by above deny options. Default=[]
 
+=item
+
+log_action_supress
+
+Array of actions to log quietly (logDetail - syslog debug level), logs messages whenever this action is performed. Default is quiet for SSH2_FXP_READ, SSH2_FXP_WRITE, SSH2_FX_OPENDIR, SSH2_FXP_READDIR, SSH2_FXP_CLOSE, SSH2_FXP_STAT SSH2_FXP_FSTAT and SSH2_FXP_LSTAT override with log_action, see below.
+
+=item
+
+log_action
+
+Array of actions to log loudly (logGeneral - syslog info level), logs messages whenever this action is performed.
+
+=item
+
+log_all_status
+
+Log all status messages at info level. By default SSH2_FX_OK and SSH2_FX_EOF will be logged at debug level.
+
 =back
 
 =head1 PERMISSIONS
@@ -1785,6 +2554,43 @@ Array of actions (see action contants in L</PERMISSIONS>) which will be given re
 =head1 CALLBACKS
 
 Callback functions can be used to perform actions when files are sent or received, for example move a fully downloaded file to a processed directory or move a received file into an input directory.
+The callback is proided with a Net::SFTP::SftpServer::File object. This object allows access to the file within the virtual chroot environment. It will also return the full filename, or move the file to an explicit location on the full filesystem. Either of these actions will break the chroot and the methods on the object will no longer be available.
+
+The following methods are provided
+
+=over
+
+=item
+
+read
+
+Read the data from the file - as the IO::File->read. Will open the file for reading if it is not already open and read back the data.
+
+=item
+
+open
+
+Will open the file - as IO::File->open but the filename is not supplied.
+
+=item
+
+getFilename
+
+Will return the filename as within the virtual chroot
+
+=item
+
+getFullFilenameBREAKCHROOT
+
+Will return the full filename on the real file system and break the virtual chroot
+
+=item
+
+renameBREAKCHROOT
+
+Takes a single argument of the new filename, will rename the file to that location and break the virtual chroot
+
+=back
 
 =head1 LOGGING
 
@@ -1889,12 +2695,12 @@ This configuration:
   $sftp->run();
 
   sub ActionOnSent {
-    my $filename = shift;
+    my $fileObject = shift;
      ## Do Stuff
   }
 
   sub ActionOnReceived {
-    my $filename = shift;
+    my $fileObject = shift;
      ## Do Stuff
   }
 
@@ -1916,7 +2722,6 @@ Sftp protocol L<http://www.openssh.org/txt/draft-ietf-secsh-filexfer-02.txt>
   cpan <at> simonday.info
 
 =head1 COPYRIGHT AND LICENSE
-
 
 Based on sftp-server.c
 Copyright (c) 2000-2004 Markus Friedl.  All rights reserved.
